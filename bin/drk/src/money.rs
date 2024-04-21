@@ -140,7 +140,7 @@ impl Drk {
     }
 
     /// Generate a new keypair and place it into the wallet.
-    pub async fn money_keygen(&self) -> WalletDbResult<()> {
+    pub async fn money_keygen(&self) -> WalletDbResult<Keypair> {
         println!("Generating a new keypair");
 
         // TODO: We might want to have hierarchical deterministic key derivation.
@@ -168,7 +168,7 @@ impl Drk {
         println!("New address:");
         println!("{}", keypair.public);
 
-        Ok(())
+        Ok(keypair)
     }
 
     /// Fetch default secret key from the wallet.
