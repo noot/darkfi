@@ -29,7 +29,7 @@ use url::Url;
 
 use darkfi::{
     async_daemonize,
-    blockchain::BlockInfo,
+    blockchain::{BlockInfo, HeaderHash},
     cli_desc,
     net::{settings::SettingsOpt, P2pPtr},
     rpc::{
@@ -137,6 +137,14 @@ pub struct BlockchainNetwork {
     #[structopt(long)]
     /// Skip syncing process and start node right away
     pub skip_sync: bool,
+
+    #[structopt(long)]
+    /// Optional sync checkpoint height
+    pub checkpoint_height: Option<u32>,
+
+    #[structopt(long)]
+    /// Optional sync checkpoint hash
+    pub checkpoint: Option<String>,
 
     /// P2P network settings
     #[structopt(flatten)]
@@ -308,13 +316,21 @@ async fn realmain(args: Args, ex: Arc<smol::Executor<'static>>) -> Result<()> {
 
     // Sync blockchain
     if !blockchain_config.skip_sync {
-        sync_task(&darkfid).await?;
+        // Parse configured checkpoint
+        if blockchain_config.checkpoint_height.is_some() && blockchain_config.checkpoint.is_none() {
+            return Err(Error::ParseFailed("Blockchain configured checkpoint hash missing"))
+        }
+
+        let checkpoint = if let Some(height) = blockchain_config.checkpoint_height {
+            Some((height, HeaderHash::from_str(&blockchain_config.checkpoint.unwrap())?))
+        } else {
+            None
+        };
+
+        sync_task(&darkfid, checkpoint).await?;
     } else {
         *darkfid.validator.synced.write().await = true;
     }
-
-    // Clean node pending transactions
-    darkfid.validator.purge_pending_txs().await?;
 
     // Consensus protocol
     info!(target: "darkfid", "Starting consensus protocol task");
@@ -330,9 +346,8 @@ async fn realmain(args: Args, ex: Arc<smol::Executor<'static>>) -> Result<()> {
 
         let task = StoppableTask::new();
         task.clone().start(
-            // Weird hack to prevent lifetimes hell
-            async move { miner_task(&darkfid, &recipient, blockchain_config.skip_sync).await },
-            |res| async {
+            miner_task(darkfid, recipient, blockchain_config.skip_sync, ex.clone()),
+            |res| async move {
                 match res {
                     Ok(()) | Err(Error::MinerTaskStopped) => { /* Do nothing */ }
                     Err(e) => error!(target: "darkfid", "Failed starting miner task: {}", e),
@@ -346,9 +361,8 @@ async fn realmain(args: Args, ex: Arc<smol::Executor<'static>>) -> Result<()> {
     } else {
         let task = StoppableTask::new();
         task.clone().start(
-            // Weird hack to prevent lifetimes hell
-            async move { consensus_task(&darkfid).await },
-            |res| async {
+            consensus_task(darkfid, ex.clone()),
+            |res| async move {
                 match res {
                     Ok(()) | Err(Error::ConsensusTaskStopped) => { /* Do nothing */ }
                     Err(e) => error!(target: "darkfid", "Failed starting consensus task: {}", e),

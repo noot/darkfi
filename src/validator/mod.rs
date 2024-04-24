@@ -26,7 +26,7 @@ use smol::lock::RwLock;
 use crate::{
     blockchain::{
         block_store::{BlockDifficulty, BlockInfo, BlockRanks},
-        Blockchain, BlockchainOverlay,
+        Blockchain, BlockchainOverlay, HeaderHash,
     },
     error::TxVerifyFailed,
     tx::Transaction,
@@ -44,7 +44,7 @@ use pow::PoWModule;
 /// Verification functions
 pub mod verification;
 use verification::{
-    verify_block, verify_genesis_block, verify_producer_transaction, verify_proposal,
+    verify_block, verify_checkpoint_block, verify_genesis_block, verify_producer_transaction,
     verify_transactions,
 };
 
@@ -149,8 +149,7 @@ impl Validator {
         // Grab a lock over current consensus forks state
         let mut forks = self.consensus.forks.write().await;
 
-        // If node participates in consensus and holds any forks, iterate over them
-        // to verify transaction validity in their overlays
+        // Iterate over them to verify transaction validity in their overlays
         for fork in forks.iter_mut() {
             // Clone forks' overlay
             let overlay = fork.overlay.lock().unwrap().full_clone()?;
@@ -181,30 +180,12 @@ impl Validator {
             }
         }
 
-        // Verify transaction against canonical state
-        let overlay = BlockchainOverlay::new(&self.blockchain)?;
-        let next_block_height = self.blockchain.last_block()?.header.height + 1;
-        let mut erroneous_txs = vec![];
-        match verify_transactions(
-            &overlay,
-            next_block_height,
-            &tx_vec,
-            &mut MerkleTree::new(1),
-            false,
-        )
-        .await
-        {
-            Ok(_) => valid = true,
-            Err(Error::TxVerifyFailed(TxVerifyFailed::ErroneousTxs(etx))) => erroneous_txs = etx,
-            Err(e) => return Err(e),
-        }
-
         // Drop forks lock
         drop(forks);
 
-        // Return error if transaction is not valid for canonical or any fork
+        // Return error if transaction is not valid for any fork
         if !valid {
-            return Err(TxVerifyFailed::ErroneousTxs(erroneous_txs).into())
+            return Err(TxVerifyFailed::ErroneousTxs(tx_vec.to_vec()).into())
         }
 
         // Add transaction to pending txs store
@@ -385,11 +366,101 @@ impl Validator {
         Ok(finalized_blocks)
     }
 
+    /// Apply provided set of [`BlockInfo`] without doing formal verification.
+    /// A set of ['HeaderHash`] is also provided, to verify that the provided
+    /// block hash matches the expected header one.
+    /// Note: this function should only be used for blocks received using a
+    /// checkpoint, since in that case we enforce the node to follow the sequence,
+    /// assuming they all its blocks are valid.
+    pub async fn add_checkpoint_blocks(
+        &self,
+        blocks: &[BlockInfo],
+        headers: &[HeaderHash],
+    ) -> Result<()> {
+        // Check provided sequences are the same length
+        if blocks.len() != headers.len() {
+            return Err(Error::InvalidInputLengths)
+        }
+
+        debug!(target: "validator::add_checkpoint_blocks", "Instantiating BlockchainOverlay");
+        let overlay = BlockchainOverlay::new(&self.blockchain)?;
+
+        // Retrieve last block difficulty to access current ranks
+        let last_difficulty = self.blockchain.last_block_difficulty()?;
+        let mut current_targets_rank = last_difficulty.ranks.targets_rank;
+        let mut current_hashes_rank = last_difficulty.ranks.hashes_rank;
+
+        // Grab current PoW module to validate each block
+        let mut module = self.consensus.module.read().await.clone();
+
+        // Keep track of all blocks transactions to remove them from pending txs store
+        let mut removed_txs = vec![];
+
+        // Validate and insert each block
+        for (index, block) in blocks.iter().enumerate() {
+            // Verify block
+            match verify_checkpoint_block(&overlay, block, &headers[index]).await {
+                Ok(()) => { /* Do nothing */ }
+                // Skip already existing block
+                Err(Error::BlockAlreadyExists(_)) => continue,
+                Err(e) => {
+                    error!(target: "validator::add_checkpoint_blocks", "Erroneous block found in set: {}", e);
+                    overlay.lock().unwrap().overlay.lock().unwrap().purge_new_trees()?;
+                    return Err(Error::BlockIsInvalid(block.hash().as_string()))
+                }
+            };
+
+            // Grab next mine target and difficulty
+            let (next_target, next_difficulty) = module.next_mine_target_and_difficulty()?;
+
+            // Calculate block rank
+            let (target_distance_sq, hash_distance_sq) = block_rank(block, &next_target);
+
+            // Update current ranks
+            current_targets_rank += target_distance_sq.clone();
+            current_hashes_rank += hash_distance_sq.clone();
+
+            // Generate block difficulty and update PoW module
+            let cummulative_difficulty =
+                module.cummulative_difficulty.clone() + next_difficulty.clone();
+            let ranks = BlockRanks::new(
+                target_distance_sq,
+                current_targets_rank.clone(),
+                hash_distance_sq,
+                current_hashes_rank.clone(),
+            );
+            let block_difficulty = BlockDifficulty::new(
+                block.header.height,
+                block.header.timestamp,
+                next_difficulty,
+                cummulative_difficulty,
+                ranks,
+            );
+            module.append_difficulty(&overlay, block_difficulty)?;
+
+            // Store block transactions
+            for tx in &block.txs {
+                removed_txs.push(tx.clone());
+            }
+        }
+
+        debug!(target: "validator::add_checkpoint_blocks", "Applying overlay changes");
+        overlay.lock().unwrap().overlay.lock().unwrap().apply()?;
+
+        // Remove blocks transactions from pending txs store
+        self.blockchain.remove_pending_txs(&removed_txs)?;
+
+        // Update PoW module
+        *self.consensus.module.write().await = module;
+
+        Ok(())
+    }
+
     /// Validate a set of [`BlockInfo`] in sequence and apply them if all are valid.
     /// Note: this function should only be used in tests when we don't want to
     /// perform consensus logic.
     pub async fn add_test_blocks(&self, blocks: &[BlockInfo]) -> Result<()> {
-        debug!(target: "validator::add_blocks", "Instantiating BlockchainOverlay");
+        debug!(target: "validator::add_test_blocks", "Instantiating BlockchainOverlay");
         let overlay = BlockchainOverlay::new(&self.blockchain)?;
 
         // Retrieve last block
@@ -408,17 +479,19 @@ impl Validator {
 
         // Validate and insert each block
         for block in blocks {
-            // Skip already existing block
-            if overlay.lock().unwrap().has_block(block)? {
-                previous = block;
-                continue;
-            }
-
             // Verify block
-            if verify_block(&overlay, &module, block, previous).await.is_err() {
-                error!(target: "validator::add_blocks", "Erroneous block found in set");
-                overlay.lock().unwrap().overlay.lock().unwrap().purge_new_trees()?;
-                return Err(Error::BlockIsInvalid(block.hash().as_string()))
+            match verify_block(&overlay, &module, block, previous).await {
+                Ok(()) => { /* Do nothing */ }
+                // Skip already existing block
+                Err(Error::BlockAlreadyExists(_)) => {
+                    previous = block;
+                    continue
+                }
+                Err(e) => {
+                    error!(target: "validator::add_test_blocks", "Erroneous block found in set: {}", e);
+                    overlay.lock().unwrap().overlay.lock().unwrap().purge_new_trees()?;
+                    return Err(Error::BlockIsInvalid(block.hash().as_string()))
+                }
             };
 
             // Grab next mine target and difficulty
@@ -458,7 +531,7 @@ impl Validator {
             previous = block;
         }
 
-        debug!(target: "validator::add_blocks", "Applying overlay changes");
+        debug!(target: "validator::add_test_blocks", "Applying overlay changes");
         overlay.lock().unwrap().overlay.lock().unwrap().apply()?;
 
         // Purge pending erroneous txs since canonical state has been changed

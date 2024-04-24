@@ -16,11 +16,12 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use std::fmt;
+use std::{fmt, str::FromStr};
 
 use darkfi_sdk::{
     blockchain::block_version,
     crypto::{MerkleNode, MerkleTree},
+    hex::decode_hex_arr,
     AsHex,
 };
 
@@ -48,6 +49,14 @@ impl HeaderHash {
 
     pub fn as_string(&self) -> String {
         self.0.hex().to_string()
+    }
+}
+
+impl FromStr for HeaderHash {
+    type Err = Error;
+
+    fn from_str(header_hash_str: &str) -> Result<Self> {
+        Ok(Self(decode_hex_arr(header_hash_str)?))
     }
 }
 
@@ -231,6 +240,15 @@ impl HeaderStore {
         Ok(headers)
     }
 
+    /// Fetch the fisrt header in the store's sync tree, based on the `Ord`
+    /// implementation for `Vec<u8>`.
+    pub fn get_first_sync(&self) -> Result<Option<Header>> {
+        let Some(found) = self.sync.first()? else { return Ok(None) };
+        let (_, header) = parse_u32_key_record(found)?;
+
+        Ok(Some(header))
+    }
+
     /// Fetch the last header in the store's sync tree, based on the `Ord`
     /// implementation for `Vec<u8>`.
     pub fn get_last_sync(&self) -> Result<Option<Header>> {
@@ -275,6 +293,15 @@ impl HeaderStore {
     /// Remove a slice of [`u32`] from the store's sync tree.
     pub fn remove_sync(&self, heights: &[u32]) -> Result<()> {
         let batch = self.remove_batch_sync(heights);
+        self.sync.apply_batch(batch)?;
+        Ok(())
+    }
+
+    /// Remove all records from the store's sync tree.
+    pub fn remove_all_sync(&self) -> Result<()> {
+        let headers = self.get_all_sync()?;
+        let heights = headers.iter().map(|h| h.0).collect::<Vec<u32>>();
+        let batch = self.remove_batch_sync(&heights);
         self.sync.apply_batch(batch)?;
         Ok(())
     }
