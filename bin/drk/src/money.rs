@@ -145,6 +145,14 @@ impl Drk {
 
         // TODO: We might want to have hierarchical deterministic key derivation.
         let keypair = Keypair::random(&mut OsRng);
+        self.put_keypair(keypair.clone()).await?;
+
+        println!("New address:");
+        println!("{}", keypair.public);
+        Ok(keypair)
+    }
+
+    pub async fn put_keypair(&self, keypair: Keypair) -> WalletDbResult<()> {
         let is_default = 0;
 
         let query = format!(
@@ -165,10 +173,7 @@ impl Drk {
             )
             .await?;
 
-        println!("New address:");
-        println!("{}", keypair.public);
-
-        Ok(keypair)
+        Ok(())
     }
 
     /// Fetch default secret key from the wallet.
