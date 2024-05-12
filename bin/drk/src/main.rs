@@ -17,12 +17,10 @@
  */
 
 use std::{
-    fs,
     io::{stdin, Read},
     process::exit,
     str::FromStr,
     sync::Arc,
-    time::Instant,
 };
 
 use prettytable::{format, row, Table};
@@ -33,7 +31,6 @@ use url::Url;
 
 use darkfi::{
     async_daemonize, cli_desc,
-    rpc::{client::RpcClient, jsonrpc::JsonRequest, util::JsonValue},
     tx::Transaction,
     util::{
         encoding::base64,
@@ -50,46 +47,10 @@ use darkfi_sdk::{
     tx::TransactionHash,
 };
 use darkfi_serial::{deserialize_async, serialize_async};
-
-/// Error codes
-mod error;
-
-/// darkfid JSON-RPC related methods
-mod rpc;
-
-/// Payment methods
-mod transfer;
-
-/// Swap methods
-mod swap;
-use swap::PartialSwapData;
-
-/// Token methods
-mod token;
-
-/// CLI utility functions
-mod cli_util;
-use cli_util::{
+use drk::{
     generate_completions, kaching, parse_token_pair, parse_tx_from_stdin, parse_value_pair,
+    DaoParams, Drk, PartialSwapData, BALANCE_BASE10_DECIMALS,
 };
-
-/// Wallet functionality related to Money
-mod money;
-use money::BALANCE_BASE10_DECIMALS;
-
-/// Wallet functionality related to Dao
-mod dao;
-use dao::DaoParams;
-
-/// Wallet functionality related to Deployooor
-mod deploy;
-
-/// Wallet functionality related to transactions history
-mod txs_history;
-
-/// Wallet database operations handler
-mod walletdb;
-use walletdb::{WalletDb, WalletPtr};
 
 const CONFIG_FILE: &str = "drk_config.toml";
 const CONFIG_FILE_CONTENTS: &str = include_str!("../drk_config.toml");
@@ -519,76 +480,6 @@ enum ContractSubcmd {
         /// Contract ID (deploy authority)
         deploy_auth: u64,
     },
-}
-
-/// CLI-util structure
-pub struct Drk {
-    /// Wallet database operations handler
-    pub wallet: WalletPtr,
-    /// JSON-RPC client to execute requests to darkfid daemon
-    pub rpc_client: Option<RpcClient>,
-}
-
-impl Drk {
-    async fn new(
-        wallet_path: String,
-        wallet_pass: String,
-        endpoint: Option<Url>,
-        ex: Arc<smol::Executor<'static>>,
-    ) -> Result<Self> {
-        // Script kiddies protection
-        if wallet_pass == "changeme" {
-            eprintln!("Please don't use default wallet password...");
-            exit(2);
-        }
-
-        // Initialize wallet
-        let wallet_path = expand_path(&wallet_path)?;
-        if !wallet_path.exists() {
-            if let Some(parent) = wallet_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-        }
-        let wallet = match WalletDb::new(Some(wallet_path), Some(&wallet_pass)) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!("Error initializing wallet: {e:?}");
-                exit(2);
-            }
-        };
-
-        // Initialize rpc client
-        let rpc_client = if let Some(endpoint) = endpoint {
-            Some(RpcClient::new(endpoint, ex).await?)
-        } else {
-            None
-        };
-
-        Ok(Self { wallet, rpc_client })
-    }
-
-    /// Initialize wallet with tables for drk
-    async fn initialize_wallet(&self) -> Result<()> {
-        let wallet_schema = include_str!("../wallet.sql");
-        if let Err(e) = self.wallet.exec_batch_sql(wallet_schema).await {
-            eprintln!("Error initializing wallet: {e:?}");
-            exit(2);
-        }
-
-        Ok(())
-    }
-
-    /// Auxiliary function to ping configured darkfid daemon for liveness.
-    async fn ping(&self) -> Result<()> {
-        println!("Executing ping request to darkfid...");
-        let latency = Instant::now();
-        let req = JsonRequest::new("ping", JsonValue::Array(vec![]));
-        let rep = self.rpc_client.as_ref().unwrap().oneshot_request(req).await?;
-        let latency = latency.elapsed();
-        println!("Got reply: {rep:?}");
-        println!("Latency: {latency:?}");
-        Ok(())
-    }
 }
 
 async_daemonize!(realmain);

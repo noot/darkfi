@@ -43,6 +43,19 @@ impl Drk {
         token_id: TokenId,
         recipient: PublicKey,
     ) -> Result<Transaction> {
+        let secret = self.default_secret().await?;
+        let keypair = Keypair::new(secret);
+        self.transfer_with_signer(amount, token_id, recipient, keypair).await
+    }
+
+    /// Create a payment transaction. Returns the transaction object on success.
+    pub async fn transfer_with_signer(
+        &self,
+        amount: &str,
+        token_id: TokenId,
+        recipient: PublicKey,
+        keypair: Keypair,
+    ) -> Result<Transaction> {
         // First get all unspent OwnCoins to see what our balance is
         let owncoins = self.get_token_coins(&token_id).await?;
         if owncoins.is_empty() {
@@ -64,9 +77,6 @@ impl Drk {
 
         // We'll also need our Merkle tree
         let tree = self.get_money_tree().await?;
-
-        let secret = self.default_secret().await?;
-        let keypair = Keypair::new(secret);
 
         // Now we need to do a lookup for the zkas proof bincodes, and create
         // the circuit objects and proving keys so we can build the transaction.
