@@ -35,20 +35,21 @@ use darkfi::{
     util::{
         encoding::base64,
         parse::{decode_base10, encode_base10},
+        path::expand_path,
     },
     zk::halo2::Field,
     Result,
 };
 use darkfi_money_contract::model::{Coin, TokenId};
 use darkfi_sdk::{
-    crypto::{FuncId, PublicKey, SecretKey},
+    crypto::{BaseBlind, FuncId, PublicKey, SecretKey},
     pasta::{group::ff::PrimeField, pallas},
     tx::TransactionHash,
 };
 use darkfi_serial::{deserialize_async, serialize_async};
 use drk::{
-    generate_completions, kaching, parse_token_pair, parse_value_pair, DaoParams, Drk,
-    PartialSwapData, BALANCE_BASE10_DECIMALS,
+    generate_completions, kaching, parse_token_pair, parse_tx_from_stdin, parse_value_pair,
+    DaoParams, Drk, PartialSwapData, BALANCE_BASE10_DECIMALS,
 };
 
 const CONFIG_FILE: &str = "drk_config.toml";
@@ -147,6 +148,9 @@ enum Subcmd {
         /// Print all the coins in the wallet
         coins: bool,
     },
+
+    /// Read a transaction from stdin and mark its input coins as spent
+    Spend,
 
     /// Unspend a coin
     Unspend {
@@ -417,8 +421,14 @@ enum AliasSubcmd {
 
 #[derive(Clone, Debug, Deserialize, StructOpt)]
 enum TokenSubcmd {
-    /// Import a mint authority secret from stdin
-    Import,
+    /// Import a mint authority
+    Import {
+        /// Mint authority secret key
+        secret_key: String,
+
+        /// Mint authority token blind
+        token_blind: String,
+    },
 
     /// Generate a new mint authority
     GenerateMint,
@@ -684,7 +694,8 @@ async fn realmain(args: Args, ex: Arc<smol::Executor<'static>>) -> Result<()> {
                     "Aliases",
                     "Value",
                     "Spend Hook",
-                    "User Data"
+                    "User Data",
+                    "Spent TX"
                 ]);
                 for coin in coins {
                     let aliases = match aliases_map.get(&coin.0.note.token_id.to_string()) {
@@ -721,7 +732,8 @@ async fn realmain(args: Args, ex: Arc<smol::Executor<'static>>) -> Result<()> {
                             encode_base10(coin.0.note.value, BALANCE_BASE10_DECIMALS)
                         ),
                         spend_hook,
-                        user_data
+                        user_data,
+                        coin.2
                     ]);
                 }
 
@@ -731,6 +743,19 @@ async fn realmain(args: Args, ex: Arc<smol::Executor<'static>>) -> Result<()> {
             }
 
             unreachable!()
+        }
+
+        Subcmd::Spend => {
+            let tx = parse_tx_from_stdin().await?;
+
+            let drk = Drk::new(args.wallet_path, args.wallet_pass, Some(args.endpoint), ex).await?;
+
+            if let Err(e) = drk.mark_tx_spend(&tx).await {
+                eprintln!("Failed to mark transaction coins as spent: {e:?}");
+                exit(2);
+            };
+
+            Ok(())
         }
 
         Subcmd::Unspend { coin } => {
@@ -862,7 +887,7 @@ async fn realmain(args: Args, ex: Arc<smol::Executor<'static>>) -> Result<()> {
                 stdin().read_to_string(&mut buf)?;
                 let Some(bytes) = base64::decode(buf.trim()) else {
                     eprintln!("Failed to decode swap transaction");
-                    exit(1);
+                    exit(2);
                 };
 
                 let mut tx: Transaction = deserialize_async(&bytes).await?;
@@ -1157,30 +1182,25 @@ async fn realmain(args: Args, ex: Arc<smol::Executor<'static>>) -> Result<()> {
         },
 
         Subcmd::Inspect => {
-            let mut buf = String::new();
-            stdin().read_to_string(&mut buf)?;
-            let Some(bytes) = base64::decode(buf.trim()) else {
-                eprintln!("Failed to decode transaction");
-                exit(1);
-            };
-
-            let tx: Transaction = deserialize_async(&bytes).await?;
+            let tx = parse_tx_from_stdin().await?;
             println!("{tx:#?}");
             Ok(())
         }
 
         Subcmd::Broadcast => {
-            println!("Reading transaction from stdin...");
-            let mut buf = String::new();
-            stdin().read_to_string(&mut buf)?;
-            let Some(bytes) = base64::decode(buf.trim()) else {
-                eprintln!("Failed to decode transaction");
-                exit(1);
-            };
-
-            let tx = deserialize_async(&bytes).await?;
+            let tx = parse_tx_from_stdin().await?;
 
             let drk = Drk::new(args.wallet_path, args.wallet_pass, Some(args.endpoint), ex).await?;
+
+            if let Err(e) = drk.simulate_tx(&tx).await {
+                eprintln!("Failed to simulate tx: {e:?}");
+                exit(2);
+            };
+
+            if let Err(e) = drk.mark_tx_spend(&tx).await {
+                eprintln!("Failed to mark transaction coins as spent: {e:?}");
+                exit(2);
+            };
 
             let txid = match drk.broadcast_tx(&tx).await {
                 Ok(t) => t,
@@ -1284,15 +1304,7 @@ async fn realmain(args: Args, ex: Arc<smol::Executor<'static>>) -> Result<()> {
             }
 
             ExplorerSubcmd::SimulateTx => {
-                println!("Reading transaction from stdin...");
-                let mut buf = String::new();
-                stdin().read_to_string(&mut buf)?;
-                let Some(bytes) = base64::decode(buf.trim()) else {
-                    eprintln!("Failed to decode transaction");
-                    exit(1);
-                };
-
-                let tx = deserialize_async(&bytes).await?;
+                let tx = parse_tx_from_stdin().await?;
 
                 let drk =
                     Drk::new(args.wallet_path, args.wallet_pass, Some(args.endpoint), ex).await?;
@@ -1423,41 +1435,35 @@ async fn realmain(args: Args, ex: Arc<smol::Executor<'static>>) -> Result<()> {
         },
 
         Subcmd::Token { command } => match command {
-            TokenSubcmd::Import => {
-                let mut buf = String::new();
-                stdin().read_to_string(&mut buf)?;
-                let mint_authority = match SecretKey::from_str(buf.trim()) {
+            TokenSubcmd::Import { secret_key, token_blind } => {
+                let mint_authority = match SecretKey::from_str(&secret_key) {
                     Ok(ma) => ma,
                     Err(e) => {
-                        eprintln!("Invalid secret key: {e:?}");
+                        eprintln!("Invalid mint authority: {e:?}");
+                        exit(2);
+                    }
+                };
+
+                let token_blind = match BaseBlind::from_str(&token_blind) {
+                    Ok(tb) => tb,
+                    Err(e) => {
+                        eprintln!("Invalid token blind: {e:?}");
                         exit(2);
                     }
                 };
 
                 let drk = Drk::new(args.wallet_path, args.wallet_pass, None, ex).await?;
-                if let Err(e) = drk.import_mint_authority(mint_authority).await {
-                    eprintln!("Importing mint authority failed: {e:?}");
-                    exit(2);
-                };
-
-                let token_id = TokenId::derive(mint_authority);
+                let token_id = drk.import_mint_authority(mint_authority, token_blind).await?;
                 println!("Successfully imported mint authority for token ID: {token_id}");
 
                 Ok(())
             }
 
             TokenSubcmd::GenerateMint => {
-                let mint_authority = SecretKey::random(&mut OsRng);
-
                 let drk = Drk::new(args.wallet_path, args.wallet_pass, None, ex).await?;
-
-                if let Err(e) = drk.import_mint_authority(mint_authority).await {
-                    eprintln!("Importing mint authority failed: {e:?}");
-                    exit(2);
-                };
-
-                // TODO: see TokenAttributes struct. I'm not sure how to restructure this rn.
-                let token_id = TokenId::derive(mint_authority);
+                let mint_authority = SecretKey::random(&mut OsRng);
+                let token_blind = BaseBlind::random(&mut OsRng);
+                let token_id = drk.import_mint_authority(mint_authority, token_blind).await?;
                 println!("Successfully imported mint authority for token ID: {token_id}");
 
                 Ok(())
@@ -1465,7 +1471,7 @@ async fn realmain(args: Args, ex: Arc<smol::Executor<'static>>) -> Result<()> {
 
             TokenSubcmd::List => {
                 let drk = Drk::new(args.wallet_path, args.wallet_pass, None, ex).await?;
-                let tokens = drk.list_tokens().await?;
+                let tokens = drk.get_mint_authorities().await?;
                 let aliases_map = match drk.get_aliases_mapped_by_token().await {
                     Ok(map) => map,
                     Err(e) => {
@@ -1476,15 +1482,21 @@ async fn realmain(args: Args, ex: Arc<smol::Executor<'static>>) -> Result<()> {
 
                 let mut table = Table::new();
                 table.set_format(*format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
-                table.set_titles(row!["Token ID", "Aliases", "Mint Authority", "Frozen"]);
+                table.set_titles(row![
+                    "Token ID",
+                    "Aliases",
+                    "Mint Authority",
+                    "Token Blind",
+                    "Frozen"
+                ]);
 
-                for (token_id, authority, frozen) in tokens {
+                for (token_id, authority, blind, frozen) in tokens {
                     let aliases = match aliases_map.get(&token_id.to_string()) {
                         Some(a) => a,
                         None => "-",
                     };
 
-                    table.add_row(row![token_id, aliases, authority, frozen]);
+                    table.add_row(row![token_id, aliases, authority, blind, frozen]);
                 }
 
                 if table.is_empty() {
@@ -1568,7 +1580,7 @@ async fn realmain(args: Args, ex: Arc<smol::Executor<'static>>) -> Result<()> {
 
                 if let Err(e) = drk.deploy_auth_keygen().await {
                     eprintln!("Error creating deploy auth keypair: {:?}", e);
-                    exit(1);
+                    exit(2);
                 }
 
                 Ok(())
@@ -1587,7 +1599,7 @@ async fn realmain(args: Args, ex: Arc<smol::Executor<'static>>) -> Result<()> {
                 }
 
                 if table.is_empty() {
-                    eprintln!("No deploy authorities found");
+                    println!("No deploy authorities found");
                 } else {
                     println!("{table}");
                 }
@@ -1607,7 +1619,7 @@ async fn realmain(args: Args, ex: Arc<smol::Executor<'static>>) -> Result<()> {
                     Ok(v) => v,
                     Err(e) => {
                         eprintln!("Error creating contract deployment tx: {}", e);
-                        exit(1);
+                        exit(2);
                     }
                 };
 
@@ -1623,7 +1635,7 @@ async fn realmain(args: Args, ex: Arc<smol::Executor<'static>>) -> Result<()> {
                     Ok(v) => v,
                     Err(e) => {
                         eprintln!("Error creating contract lock tx: {}", e);
-                        exit(1);
+                        exit(2);
                     }
                 };
 

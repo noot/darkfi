@@ -173,7 +173,7 @@ impl Wallet {
 
         // The Merkle tree for the `Money` contract is initialized with a "null"
         // leaf at position 0.
-        let mut money_merkle_tree = MerkleTree::new(100);
+        let mut money_merkle_tree = MerkleTree::new(1);
         money_merkle_tree.append(MerkleNode::from(pallas::Base::ZERO));
         money_merkle_tree.mark().unwrap();
 
@@ -189,8 +189,8 @@ impl Wallet {
             money_merkle_tree,
             money_null_smt,
             money_null_smt_snapshot: None,
-            dao_merkle_tree: MerkleTree::new(100),
-            dao_proposals_tree: MerkleTree::new(100),
+            dao_merkle_tree: MerkleTree::new(1),
+            dao_proposals_tree: MerkleTree::new(1),
             unspent_money_coins: vec![],
             spent_money_coins: vec![],
             dao_leafs: HashMap::new(),
@@ -204,13 +204,14 @@ impl Wallet {
         callname: &str,
         tx: Transaction,
         block_height: u32,
-        verify_fees: bool,
     ) -> Result<()> {
         if self.bench_wasm {
             benchmark_wasm_calls(callname, &self.validator, &tx, block_height);
         }
 
-        self.validator.add_transactions(&[tx.clone()], block_height, true, verify_fees).await?;
+        self.validator
+            .add_test_transactions(&[tx.clone()], block_height, true, self.validator.verify_fees)
+            .await?;
 
         // Write the data
         {

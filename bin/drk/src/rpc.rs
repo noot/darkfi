@@ -56,7 +56,7 @@ impl Drk {
         ex: Arc<smol::Executor<'static>>,
     ) -> Result<()> {
         let req = JsonRequest::new("blockchain.last_known_block", JsonValue::Array(vec![]));
-        let rep = self.rpc_client.request(req).await?;
+        let rep = self.rpc_client.as_ref().unwrap().request(req).await?;
         let last_known = *rep.get::<f64>().unwrap() as u32;
         let last_scanned = match self.last_scanned_block().await {
             Ok(l) => l,
@@ -140,9 +140,16 @@ impl Drk {
                                 "[subscribe_blocks] Scanning block failed: {e:?}"
                             )))
                         }
-                        if let Err(e) = self
-                            .update_tx_history_records_status(&block_data.txs, "Finalized")
-                            .await
+                        let txs_hashes = match self.insert_tx_history_records(&block_data.txs).await {
+                            Ok(hashes) => hashes,
+                            Err(e) => {
+                                return Err(Error::RusqliteError(format!(
+                                    "[subscribe_blocks] Inserting transaction history records failed: {e:?}"
+                                )))
+                            },
+                        };
+                        if let Err(e) =
+                            self.update_tx_history_records_status(&txs_hashes, "Finalized").await
                         {
                             return Err(Error::RusqliteError(format!(
                                 "[subscribe_blocks] Update transaction history record status failed: {e:?}"
@@ -174,11 +181,12 @@ impl Drk {
     async fn scan_block(&self, block: &BlockInfo) -> Result<()> {
         println!("[scan_block] Iterating over {} transactions", block.txs.len());
         for tx in block.txs.iter() {
-            println!("[scan_block] Processing transaction: {}", tx.hash());
+            let tx_hash = tx.hash().to_string();
+            println!("[scan_block] Processing transaction: {tx_hash}");
             for (i, call) in tx.calls.iter().enumerate() {
                 if call.data.contract_id == *MONEY_CONTRACT_ID {
                     println!("[scan_block] Found Money contract in call {i}");
-                    self.apply_tx_money_data(&call.data.data).await?;
+                    self.apply_tx_money_data(&call.data.data, &tx_hash).await?;
                     continue
                 }
 
@@ -242,7 +250,7 @@ impl Drk {
 
         loop {
             let req = JsonRequest::new("blockchain.last_known_block", JsonValue::Array(vec![]));
-            let rep = match self.rpc_client.request(req).await {
+            let rep = match self.rpc_client.as_ref().unwrap().request(req).await {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("[scan_blocks] RPC client request failed: {e:?}");
@@ -260,7 +268,7 @@ impl Drk {
             }
 
             while height <= last {
-                eprint!("Requesting block {}... ", height);
+                println!("Requesting block {}... ", height);
                 let block = match self.get_block_by_height(height).await {
                     Ok(r) => r,
                     Err(e) => {
@@ -272,20 +280,21 @@ impl Drk {
                     eprintln!("[scan_blocks] Scan block failed: {e:?}");
                     return Err(WalletDbError::GenericError)
                 };
-                self.update_tx_history_records_status(&block.txs, "Finalized").await?;
+                let txs_hashes = self.insert_tx_history_records(&block.txs).await?;
+                self.update_tx_history_records_status(&txs_hashes, "Finalized").await?;
                 height += 1;
             }
         }
     }
 
-    // Queries darkfid for a block with given height
+    // Queries darkfid for a block with given height.
     async fn get_block_by_height(&self, height: u32) -> Result<BlockInfo> {
         let req = JsonRequest::new(
             "blockchain.get_block",
             JsonValue::Array(vec![JsonValue::String(height.to_string())]),
         );
 
-        let params = self.rpc_client.request(req).await?;
+        let params = self.rpc_client.as_ref().unwrap().request(req).await?;
         let param = params.get::<String>().unwrap();
         let bytes = base64::decode(param).unwrap();
         let block = deserialize_async(&bytes).await?;
@@ -293,14 +302,14 @@ impl Drk {
     }
 
     /// Broadcast a given transaction to darkfid and forward onto the network.
-    /// Returns the transaction ID upon success
+    /// Returns the transaction ID upon success.
     pub async fn broadcast_tx(&self, tx: &Transaction) -> Result<String> {
         println!("Broadcasting transaction...");
 
         let params =
             JsonValue::Array(vec![JsonValue::String(base64::encode(&serialize_async(tx).await))]);
         let req = JsonRequest::new("tx.broadcast", params);
-        let rep = self.rpc_client.request(req).await?;
+        let rep = self.rpc_client.as_ref().unwrap().request(req).await?;
 
         let txid = rep.get::<String>().unwrap().clone();
 
@@ -314,7 +323,7 @@ impl Drk {
         Ok(txid)
     }
 
-    /// Queries darkfid for a tx with given hash
+    /// Queries darkfid for a tx with given hash.
     pub async fn get_tx(&self, tx_hash: &TransactionHash) -> Result<Option<Transaction>> {
         let tx_hash_str = tx_hash.to_string();
         let req = JsonRequest::new(
@@ -322,7 +331,7 @@ impl Drk {
             JsonValue::Array(vec![JsonValue::String(tx_hash_str)]),
         );
 
-        match self.rpc_client.request(req).await {
+        match self.rpc_client.as_ref().unwrap().request(req).await {
             Ok(param) => {
                 let tx_bytes = base64::decode(param.get::<String>().unwrap()).unwrap();
                 let tx = deserialize_async(&tx_bytes).await?;
@@ -333,12 +342,12 @@ impl Drk {
         }
     }
 
-    /// Simulate the transaction with the state machine
+    /// Simulate the transaction with the state machine.
     pub async fn simulate_tx(&self, tx: &Transaction) -> Result<bool> {
         let tx_str = base64::encode(&serialize_async(tx).await);
         let req =
             JsonRequest::new("tx.simulate", JsonValue::Array(vec![JsonValue::String(tx_str)]));
-        let rep = self.rpc_client.request(req).await?;
+        let rep = self.rpc_client.as_ref().unwrap().request(req).await?;
 
         let is_valid = *rep.get::<bool>().unwrap();
         Ok(is_valid)
@@ -346,22 +355,33 @@ impl Drk {
 
     /// Try to fetch zkas bincodes for the given `ContractId`.
     pub async fn lookup_zkas(&self, contract_id: &ContractId) -> Result<Vec<(String, Vec<u8>)>> {
-        println!("Querying zkas bincode for {contract_id}");
-
         let params = JsonValue::Array(vec![JsonValue::String(format!("{contract_id}"))]);
         let req = JsonRequest::new("blockchain.lookup_zkas", params);
 
-        let rep = self.rpc_client.request(req).await?;
+        let rep = self.rpc_client.as_ref().unwrap().request(req).await?;
         let params = rep.get::<Vec<JsonValue>>().unwrap();
 
         let mut ret = Vec::with_capacity(params.len());
         for param in params {
             let zkas_ns = param[0].get::<String>().unwrap().clone();
-            let zkas_bincode_bytes = base64::decode(param.get::<String>().unwrap()).unwrap();
-            let zkas_bincode = deserialize_async(&zkas_bincode_bytes).await?;
-            ret.push((zkas_ns, zkas_bincode));
+            let zkas_bincode_bytes = base64::decode(param[1].get::<String>().unwrap()).unwrap();
+            ret.push((zkas_ns, zkas_bincode_bytes));
         }
 
         Ok(ret)
+    }
+
+    /// Queries darkfid for given transaction's gas.
+    pub async fn get_tx_gas(&self, tx: &Transaction, include_fee: bool) -> Result<u64> {
+        let params = JsonValue::Array(vec![
+            JsonValue::String(base64::encode(&serialize_async(tx).await)),
+            JsonValue::Boolean(include_fee),
+        ]);
+        let req = JsonRequest::new("tx.calculate_gas", params);
+        let rep = self.rpc_client.as_ref().unwrap().request(req).await?;
+
+        let gas = *rep.get::<f64>().unwrap() as u64;
+
+        Ok(gas)
     }
 }

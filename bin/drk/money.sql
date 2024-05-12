@@ -1,6 +1,5 @@
 -- Wallet definitions for this contract.
 -- We store data that is needed to be able to receive and send tokens.
--- TODO: The tables should be prefixed with ContractId to prevent collision
 
 -- Arbitrary info that is potentially useful
 CREATE TABLE IF NOT EXISTS BZHKGQ26bzmBithTQYTJtjo2QdCqpkR9tjSBopT4yf4o_money_info (
@@ -34,13 +33,15 @@ CREATE TABLE IF NOT EXISTS BZHKGQ26bzmBithTQYTJtjo2QdCqpkR9tjSBopT4yf4o_money_co
 	secret BLOB NOT NULL,
 	nullifier BLOB NOT NULL,
 	leaf_position BLOB NOT NULL,
-	memo BLOB
+	memo BLOB,
+	spent_tx_hash TEXT DEFAULT '-'
 );
 
 -- Arbitrary tokens
 CREATE TABLE IF NOT EXISTS BZHKGQ26bzmBithTQYTJtjo2QdCqpkR9tjSBopT4yf4o_money_tokens (
-	mint_authority BLOB PRIMARY KEY NOT NULL,
-	token_id BLOB NOT NULL,
+	token_id BLOB PRIMARY KEY NOT NULL,
+	mint_authority BLOB NOT NULL,
+	token_blind BLOB NOT NULL,
 	is_frozen INTEGER NOT NULL
 );
 
@@ -48,11 +49,4 @@ CREATE TABLE IF NOT EXISTS BZHKGQ26bzmBithTQYTJtjo2QdCqpkR9tjSBopT4yf4o_money_to
 CREATE TABLE IF NOT EXISTS BZHKGQ26bzmBithTQYTJtjo2QdCqpkR9tjSBopT4yf4o_money_aliases (
 	alias BLOB PRIMARY KEY NOT NULL,
 	token_id BLOB NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS BZHKGQ26bzmBithTQYTJtjo2QdCqpkR9tjSBopT4yf4o_transactions_history (
-	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-	transaction_hash TEXT UNIQUE NOT NULL,
-	status TEXT NOT NULL,
-	tx TEXT UNIQUE NOT NULL
 );

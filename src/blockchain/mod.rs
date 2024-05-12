@@ -271,17 +271,22 @@ impl Blockchain {
     /// Remove a given slice of pending transactions from the blockchain database.
     pub fn remove_pending_txs(&self, txs: &[Transaction]) -> Result<()> {
         let txs_hashes: Vec<TransactionHash> = txs.iter().map(|tx| tx.hash()).collect();
+        self.remove_pending_txs_hashes(&txs_hashes)
+    }
+
+    /// Remove a given slice of pending transactions hashes from the blockchain database.
+    pub fn remove_pending_txs_hashes(&self, txs: &[TransactionHash]) -> Result<()> {
         let indexes = self.transactions.get_all_pending_order()?;
-        // We could do indexes.iter().map(|x| txs_hashes.contains(x.1)).collect.map(|x| x.0).collect
+        // We could do indexes.iter().map(|x| txs.contains(x.1)).collect.map(|x| x.0).collect
         // but this is faster since we don't do the second iteration
         let mut removed_indexes = vec![];
         for index in indexes {
-            if txs_hashes.contains(&index.1) {
+            if txs.contains(&index.1) {
                 removed_indexes.push(index.0);
             }
         }
 
-        let txs_batch = self.transactions.remove_batch_pending(&txs_hashes);
+        let txs_batch = self.transactions.remove_batch_pending(txs);
         let txs_order_batch = self.transactions.remove_batch_pending_order(&removed_indexes);
 
         // Perform an atomic transaction over the trees and apply the batches.

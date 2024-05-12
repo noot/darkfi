@@ -541,13 +541,21 @@ async fn realmain(settings: Args, executor: Arc<smol::Executor<'static>>) -> Res
     signals_handler.wait_termination(signals_task).await?;
     info!("Caught termination signal, cleaning up and exiting...");
 
+    info!("Stopping P2P network");
+    p2p.stop().await;
+
     info!(target: "taud", "Stopping JSON-RPC server...");
     rpc_task.stop().await;
+    dnet_task.stop().await;
+    deg_task.stop().await;
 
     info!(target: "taud", "Stopping sync loop task...");
     sync_loop_task.stop().await;
 
-    p2p.stop().await;
+    info!("Flushing sled database...");
+    let flushed_bytes = sled_db.flush_async().await?;
+    info!("Flushed {} bytes", flushed_bytes);
 
+    info!("Shut down successfully");
     Ok(())
 }

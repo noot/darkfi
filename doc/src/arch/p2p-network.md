@@ -18,7 +18,7 @@ Connections are then wrapped in a `Channel` abstraction which allows
 protocols to be attached. See `src/net/protocol/` and run `fd protocol` for custom
 application specific network protocols. Also see the follow tutorial:
 
-* [Understanding Protocols](learn/dchat/creating-dchat/protocols.md)
+* [Understanding Protocols](../learn/dchat/creating-dchatd/protocols.md)
 
 ## Outbound Session
 
@@ -97,6 +97,12 @@ The main attacks are:
   the traffic you see. For example they might send you a payment, then want to doublespend without you
   knowing about it.
 * **Denial of Service**. Usually happens when a node is overloaded by too much data being sent.
+
+From [libp2p2 DoS mitigation](
+https://docs.libp2p.io/concepts/security/dos-mitigation/): "An attack is
+considered viable if it takes fewer resources to execute than the damage
+it does. In other words, if the payoff is higher than the investment it
+is a viable attack and should be mitigated."
 
 ### Common Mitigations
 
@@ -179,12 +185,6 @@ To faciliate this future upgrade, we have made the peer discovery process a gene
 
 ## Scoring Subsystem
 
-From [libp2p2 DoS mitigation](
-https://docs.libp2p.io/concepts/security/dos-mitigation/): "An attack is
-considered viable if it takes fewer resources to execute than the damage
-it does. In other words, if the payoff is higher than the investment it
-is a viable attack and should be mitigated."
-
 Connections should maintain a scoring system. Protocols can increment the score.
 
 The score backs off exponentially. If the watermark is crossed then the
@@ -263,3 +263,44 @@ reached its limit (to protect against ellipse attack).
 Limits have a default setting that can be configured. It's also possible
 to scale limits with a particular config that allows for scaling to
 different machines.
+
+### DarkFi p2p resource manager
+
+The goal is to make something simple that we can extend later if necessary
+given how it behaves in the wild. We have simplified the libp2p `Resource
+management scopes` into a straightforward hierarchy:
+
+```
+            node
+              +
+           channel
+              +
+       +------|------+
+       +             +
+    message       protocol  
+
+```
+
+Resource usage is calculated from `Message` and `Protocol` and stored in
+`Channel`. We can sum the total resources by adding the total amount
+of resources used by each channel using the `p2p` method `channels()`,
+(this is easy since `Channel` has access to `p2p` via a weak ptr).
+
+Resources are arranged in a struct called `AbstractComputer` which
+contains resource usage indicators such as: CPU, Memory, hard disk,
+bandwidth, etc.
+
+The `ScoringSubsystem` monitors scoring actions such as `send_message`
+or `recv_message` (and other actions that make use of resources defined
+by the `AbstractComputer`) and increments the resource usage.
+
+There is also a `Controller` that defines limits and decides on what action
+to take when a given limit has been breached (such as `channel.ban()`,
+`channel.throttle()` (TODO), or `choke()`, `snub()` etc (also TODO). It
+is important that the limits set by the `Controller` are configurable and
+can be injected in at runtime since `Message` and `Protocol` are dynamic,
+user-defined types.
+
+TODO:
+* implement `ScoringSubsystem`, `AbstractComputer`, and `Controller`.
+

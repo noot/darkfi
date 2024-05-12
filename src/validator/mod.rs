@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use darkfi_sdk::crypto::MerkleTree;
 use log::{debug, error, info, warn};
@@ -30,6 +30,7 @@ use crate::{
     },
     error::TxVerifyFailed,
     tx::Transaction,
+    zk::VerifyingKey,
     Error, Result,
 };
 
@@ -45,7 +46,7 @@ use pow::PoWModule;
 pub mod verification;
 use verification::{
     verify_block, verify_checkpoint_block, verify_genesis_block, verify_producer_transaction,
-    verify_transactions,
+    verify_transaction, verify_transactions,
 };
 
 /// Fee calculation helpers
@@ -53,7 +54,7 @@ pub mod fees;
 
 /// Helper utilities
 pub mod utils;
-use utils::{block_rank, deploy_native_contracts};
+use utils::{best_fork_index, block_rank, deploy_native_contracts};
 
 /// Configuration for initializing [`Validator`]
 #[derive(Clone)]
@@ -127,6 +128,42 @@ impl Validator {
         Ok(state)
     }
 
+    /// Auxiliary function to compute provided transaction's total gas,
+    /// against current best fork.
+    /// The function takes a boolean called `verify_fee` to overwrite
+    /// the nodes configured `verify_fees` flag.
+    pub async fn calculate_gas(&self, tx: &Transaction, verify_fee: bool) -> Result<u64> {
+        // Grab the best fork to verify against
+        let forks = self.consensus.forks.read().await;
+        let fork = forks[best_fork_index(&forks)?].full_clone()?;
+        drop(forks);
+
+        // Map of ZK proof verifying keys for the transaction
+        let mut vks: HashMap<[u8; 32], HashMap<String, VerifyingKey>> = HashMap::new();
+        for call in &tx.calls {
+            vks.insert(call.data.contract_id.to_bytes(), HashMap::new());
+        }
+
+        // Grab forks' next block height
+        let next_block_height = fork.get_next_block_height()?;
+
+        // Verify transaction to grab the gas used
+        let verify_result = verify_transaction(
+            &fork.overlay,
+            next_block_height,
+            tx,
+            &mut MerkleTree::new(1),
+            &mut vks,
+            verify_fee,
+        )
+        .await;
+
+        // Purge new trees
+        fork.overlay.lock().unwrap().overlay.lock().unwrap().purge_new_trees()?;
+
+        Ok(verify_result?.0)
+    }
+
     /// The node retrieves a transaction, validates its state transition,
     /// and appends it to the pending txs store.
     pub async fn append_tx(&self, tx: &Transaction, write: bool) -> Result<()> {
@@ -149,24 +186,29 @@ impl Validator {
         // Grab a lock over current consensus forks state
         let mut forks = self.consensus.forks.write().await;
 
-        // Iterate over them to verify transaction validity in their overlays
+        // Iterate over node forks to verify transaction validity in their overlays
         for fork in forks.iter_mut() {
-            // Clone forks' overlay
-            let overlay = fork.overlay.lock().unwrap().full_clone()?;
+            // Clone fork state
+            let fork_clone = fork.full_clone()?;
 
             // Grab forks' next block height
-            let next_block_height = fork.get_next_block_height()?;
+            let next_block_height = fork_clone.get_next_block_height()?;
 
             // Verify transaction
-            match verify_transactions(
-                &overlay,
+            let verify_result = verify_transactions(
+                &fork_clone.overlay,
                 next_block_height,
                 &tx_vec,
                 &mut MerkleTree::new(1),
-                false,
+                self.verify_fees,
             )
-            .await
-            {
+            .await;
+
+            // Purge new trees
+            fork_clone.overlay.lock().unwrap().overlay.lock().unwrap().purge_new_trees()?;
+
+            // Handle response
+            match verify_result {
                 Ok(_) => {}
                 Err(Error::TxVerifyFailed(TxVerifyFailed::ErroneousTxs(_))) => continue,
                 Err(e) => return Err(e),
@@ -217,25 +259,29 @@ impl Validator {
             let tx_vec = [tx.clone()];
             let mut valid = false;
 
-            // If node participates in consensus and holds any forks, iterate over them
-            // to verify transaction validity in their overlays
+            // Iterate over node forks to verify transaction validity in their overlays
             for fork in forks.iter_mut() {
-                // Clone forks' overlay
-                let overlay = fork.overlay.lock().unwrap().full_clone()?;
+                // Clone fork state
+                let fork_clone = fork.full_clone()?;
 
                 // Grab forks' next block height
-                let next_block_height = fork.get_next_block_height()?;
+                let next_block_height = fork_clone.get_next_block_height()?;
 
                 // Verify transaction
-                match verify_transactions(
-                    &overlay,
+                let verify_result = verify_transactions(
+                    &fork_clone.overlay,
                     next_block_height,
                     &tx_vec,
                     &mut MerkleTree::new(1),
-                    false,
+                    self.verify_fees,
                 )
-                .await
-                {
+                .await;
+
+                // Purge new trees
+                fork_clone.overlay.lock().unwrap().overlay.lock().unwrap().purge_new_trees()?;
+
+                // Handle response
+                match verify_result {
                     Ok(_) => {
                         valid = true;
                         continue
@@ -246,23 +292,6 @@ impl Validator {
 
                 // Remove erroneous transaction from forks' mempool
                 fork.mempool.retain(|x| *x != tx_hash);
-            }
-
-            // Verify transaction against canonical state
-            let overlay = BlockchainOverlay::new(&self.blockchain)?;
-            let next_block_height = self.blockchain.last_block()?.header.height + 1;
-            match verify_transactions(
-                &overlay,
-                next_block_height,
-                &tx_vec,
-                &mut MerkleTree::new(1),
-                false,
-            )
-            .await
-            {
-                Ok(_) => valid = true,
-                Err(Error::TxVerifyFailed(TxVerifyFailed::ErroneousTxs(_))) => {}
-                Err(e) => return Err(e),
             }
 
             // Remove pending transaction if it's not valid for canonical or any fork
@@ -547,10 +576,12 @@ impl Validator {
     /// Validate a set of [`Transaction`] in sequence and apply them if all are valid.
     /// In case any of the transactions fail, they will be returned to the caller.
     /// The function takes a boolean called `write` which tells it to actually write
-    /// the state transitions to the database.
+    /// the state transitions to the database, and a boolean called `verify_fees` to
+    /// overwrite the nodes configured `verify_fees` flag.
     ///
     /// Returns the total gas used for the given transactions.
-    pub async fn add_transactions(
+    /// Note: this function should only be used in tests.
+    pub async fn add_test_transactions(
         &self,
         txs: &[Transaction],
         verifying_block_height: u32,

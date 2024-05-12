@@ -21,7 +21,9 @@ mod token;
 
 /// CLI utility functions
 mod cli_util;
-pub use cli_util::{generate_completions, kaching, parse_token_pair, parse_value_pair};
+pub use cli_util::{
+    generate_completions, kaching, parse_token_pair, parse_tx_from_stdin, parse_value_pair,
+};
 
 /// Wallet functionality related to Money
 mod money;
@@ -30,6 +32,9 @@ pub use money::BALANCE_BASE10_DECIMALS;
 /// Wallet functionality related to Dao
 mod dao;
 pub use dao::DaoParams;
+
+/// Wallet functionality related to Deployooor
+mod deploy;
 
 /// Wallet functionality related to transactions history
 mod txs_history;

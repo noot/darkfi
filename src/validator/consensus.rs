@@ -18,10 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use darkfi_sdk::{
-    crypto::{MerkleTree, SecretKey},
-    tx::TransactionHash,
-};
+use darkfi_sdk::{crypto::MerkleTree, tx::TransactionHash};
 use darkfi_serial::{async_trait, SerialDecodable, SerialEncodable};
 use log::{debug, info};
 use num_bigint::BigUint;
@@ -31,10 +28,9 @@ use smol::lock::RwLock;
 use crate::{
     blockchain::{
         block_store::{BlockDifficulty, BlockRanks},
-        BlockInfo, Blockchain, BlockchainOverlay, BlockchainOverlayPtr, Header, HeaderHash,
+        BlockInfo, Blockchain, BlockchainOverlay, BlockchainOverlayPtr, HeaderHash,
     },
     tx::Transaction,
-    util::time::Timestamp,
     validator::{
         pow::PoWModule,
         utils::{best_fork_index, block_rank, find_extended_fork_index},
@@ -479,10 +475,10 @@ impl Consensus {
         forks.retain(|_| *iter.next().unwrap());
 
         // Remove finalized proposals txs from the unporposed txs sled tree
-        self.blockchain.transactions.remove_pending(&finalized_txs_hashes)?;
+        self.blockchain.remove_pending_txs_hashes(&finalized_txs_hashes)?;
 
         // Remove unreferenced txs from the unporposed txs sled tree
-        self.blockchain.transactions.remove_pending(&Vec::from_iter(dropped_txs))?;
+        self.blockchain.remove_pending_txs_hashes(&Vec::from_iter(dropped_txs))?;
 
         // Drop forks lock
         drop(forks);
@@ -557,50 +553,6 @@ impl Fork {
         })
     }
 
-    /// Generate an unsigned block containing all pending transactions.
-    pub async fn generate_unsigned_block(&self, producer_tx: Transaction) -> Result<BlockInfo> {
-        // Grab forks' last block proposal(previous)
-        let previous = self.last_proposal()?;
-
-        // Grab forks' next block height
-        let next_block_height = previous.block.header.height + 1;
-
-        // Grab forks' unproposed transactions
-        let mut unproposed_txs = self.unproposed_txs(&self.blockchain, next_block_height).await?;
-        unproposed_txs.push(producer_tx);
-
-        // Generate the new header
-        let header =
-            Header::new(previous.block.hash(), next_block_height, Timestamp::current_time(), 0);
-
-        // Generate the block
-        let mut block = BlockInfo::new_empty(header);
-
-        // Add transactions to the block
-        block.append_txs(unproposed_txs);
-
-        Ok(block)
-    }
-
-    /// Generate a block proposal containing all pending transactions.
-    /// Proposal is signed using provided secret key, which must also
-    /// have signed the provided proposal transaction.
-    pub async fn generate_signed_proposal(
-        &self,
-        producer_tx: Transaction,
-        secret_key: &SecretKey,
-    ) -> Result<Proposal> {
-        let mut block = self.generate_unsigned_block(producer_tx).await?;
-
-        // Sign block
-        block.sign(secret_key);
-
-        // Generate the block proposal from the block
-        let proposal = Proposal::new(block);
-
-        Ok(proposal)
-    }
-
     /// Auxiliary function to append a proposal and update current fork rank.
     pub async fn append_proposal(&mut self, proposal: &Proposal) -> Result<()> {
         // Grab next mine target and difficulty
@@ -642,11 +594,10 @@ impl Fork {
 
     /// Auxiliary function to retrieve last proposal.
     pub fn last_proposal(&self) -> Result<Proposal> {
-        let block = if self.proposals.is_empty() {
-            self.overlay.lock().unwrap().last_block()?
+        let block = if let Some(last) = self.proposals.last() {
+            self.overlay.lock().unwrap().get_blocks_by_hash(&[*last])?[0].clone()
         } else {
-            self.overlay.lock().unwrap().get_blocks_by_hash(&[*self.proposals.last().unwrap()])?[0]
-                .clone()
+            self.overlay.lock().unwrap().last_block()?
         };
 
         Ok(Proposal::new(block))
@@ -658,22 +609,24 @@ impl Fork {
         Ok(proposal.block.header.height + 1)
     }
 
-    /// Auxiliary function to retrieve unproposed valid transactions.
+    /// Auxiliary function to retrieve unproposed valid transactions,
+    /// along with their total paid fees.
     pub async fn unproposed_txs(
         &self,
         blockchain: &Blockchain,
         verifying_block_height: u32,
-    ) -> Result<Vec<Transaction>> {
+        verify_fees: bool,
+    ) -> Result<(Vec<Transaction>, u64)> {
         // Check if our mempool is not empty
         if self.mempool.is_empty() {
-            return Ok(vec![])
+            return Ok((vec![], 0))
         }
 
         // Transactions Merkle tree
         let mut tree = MerkleTree::new(1);
 
         // Gas accumulator
-        let mut _gas_used = 0;
+        let mut gas_paid = 0;
 
         // Map of ZK proof verifying keys for the current transaction batch
         let mut vks: HashMap<[u8; 32], HashMap<String, VerifyingKey>> = HashMap::new();
@@ -703,20 +656,19 @@ impl Fork {
 
             // Verify the transaction against current state
             overlay.lock().unwrap().checkpoint();
-            // TODO: shouldn't verify fees be true?
             match verify_transaction(
                 &overlay,
                 verifying_block_height,
                 &unproposed_tx,
                 &mut tree,
                 &mut vks,
-                false,
+                verify_fees,
             )
             .await
             {
-                Ok(gas) => _gas_used += gas,
+                Ok((_, gas)) => gas_paid += gas,
                 Err(e) => {
-                    debug!(target: "validator::verification::verify_transactions", "Transaction verification failed: {}", e);
+                    debug!(target: "validator::consensus::unproposed_txs", "Transaction verification failed: {}", e);
                     overlay.lock().unwrap().revert_to_checkpoint()?;
                     continue
                 }
@@ -732,7 +684,7 @@ impl Fork {
             }
         }
 
-        Ok(unproposed_txs)
+        Ok((unproposed_txs, gas_paid))
     }
 
     /// Auxiliary function to create a full clone using BlockchainOverlay::full_clone.

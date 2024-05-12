@@ -32,14 +32,14 @@ pub struct Drk {
     /// Wallet database operations handler
     pub wallet: WalletPtr,
     /// JSON-RPC client to execute requests to darkfid daemon
-    pub rpc_client: RpcClient,
+    pub rpc_client: Option<RpcClient>,
 }
 
 impl Drk {
     pub async fn new(
         wallet_path: String,
         wallet_pass: String,
-        endpoint: Url,
+        endpoint: Option<Url>,
         ex: Arc<smol::Executor<'static>>,
     ) -> Result<Self> {
         // Script kiddies protection
@@ -64,7 +64,11 @@ impl Drk {
         };
 
         // Initialize rpc client
-        let rpc_client = RpcClient::new(endpoint, ex).await?;
+        let rpc_client = if let Some(endpoint) = endpoint {
+            Some(RpcClient::new(endpoint, ex).await?)
+        } else {
+            None
+        };
 
         Ok(Self { wallet, rpc_client })
     }
@@ -85,7 +89,7 @@ impl Drk {
         println!("Executing ping request to darkfid...");
         let latency = Instant::now();
         let req = JsonRequest::new("ping", JsonValue::Array(vec![]));
-        let rep = self.rpc_client.oneshot_request(req).await?;
+        let rep = self.rpc_client.as_ref().unwrap().oneshot_request(req).await?;
         let latency = latency.elapsed();
         println!("Got reply: {rep:?}");
         println!("Latency: {latency:?}");
